@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+
 #include <stdlib.h>
 #include <stdio.h>
 #include <ctype.h>
@@ -7,6 +9,8 @@
 #include "signal.h"
 #include "timing.h"
 
+#include <pthread.h>  // pthread api
+
 #define MAXWIDTH 40
 #define THRESHOLD 2.0
 #define ALIENS_LOW  50000.0
@@ -15,6 +19,7 @@
 void usage() {
   printf("usage: band_scan text|bin|mmap signal_file Fs filter_order num_bands\n");
 }
+
 
 double avg_power(double* data, int num) {
 
@@ -57,8 +62,74 @@ void remove_dc(double* data, int num) {
   }
 }
 
+typedef struct{
+  int start;
+  int end;
+  double* power;
+  signal* signal;
+  int filter_order;
+  double bandwidth;
+  double* filter_coeffs;
+} Inputs;
 
-int analyze_signal(signal* sig, int filter_order, int num_bands, double* lb, double* ub) {
+void* worker(void* arg, int myid, int num_threads, int num_processors) {
+  Inputs* inputs = (Inputs*) arg;
+  int start = inputs->start;
+  int end = inputs->end;
+  double* band_power = inputs->power;
+  signal* sig = inputs->signal;
+  int filter_order = inputs->filter_order;
+  double bandwidth = inputs->bandwidth;
+  double* filter_coeffs = inputs->filter_coeffs;
+
+
+
+
+
+  // long myid   = (long)arg;
+  // long mytid  = tid[myid];  // notice access to shared variable
+  // long mytime = 1 + rand() % 10;
+
+  // printf("Hello from thread %ld (tid %ld)\n",myid,mytid);
+  // printf("Thread %ld is putting itself onto procesor %ld\n", myid, myid % numproc);
+
+  // put ourselves on the desired processor
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  CPU_SET(myid % num_processors, &set);
+  if (sched_setaffinity(0,sizeof(set),&set) < 0) { // do it
+    perror("Can't setaffinity");  // hopefully doesn't fail
+    exit(-1);
+  }
+
+  for (int band = start; band < end; band++) {
+    // Make the filter
+    generate_band_pass(sig->Fs,
+                       band * bandwidth + 0.0001, // keep within limits
+                       (band + 1) * bandwidth - 0.0001,
+                       filter_order,
+                       filter_coeffs);
+    hamming_window(filter_order,filter_coeffs);
+
+    // Convolve
+    convolve_and_compute_power(sig->num_samples,
+                               sig->data,
+                               filter_order,
+                               filter_coeffs,
+                               &(band_power[band]));
+
+  }
+
+  pthread_exit(NULL); // finish - no return value
+}
+
+
+int analyze_signal(signal* sig, int filter_order, int num_bands, double* lb, double* ub, int num_threads, int num_processors) {
+
+  
+  
+
+
 
   double Fc        = (sig->Fs) / 2;
   double bandwidth = Fc / num_bands;
@@ -76,23 +147,60 @@ int analyze_signal(signal* sig, int filter_order, int num_bands, double* lb, dou
 
   double filter_coeffs[filter_order + 1];
   double band_power[num_bands];
-  for (int band = 0; band < num_bands; band++) {
-    // Make the filter
-    generate_band_pass(sig->Fs,
-                       band * bandwidth + 0.0001, // keep within limits
-                       (band + 1) * bandwidth - 0.0001,
-                       filter_order,
-                       filter_coeffs);
-    hamming_window(filter_order,filter_coeffs);
 
-    // Convolve
-    convolve_and_compute_power(sig->num_samples,
-                               sig->data,
-                               filter_order,
-                               filter_coeffs,
-                               &(band_power[band]));
 
+  int band_size = num_bands / num_threads;
+  int remainder = num_bands % num_threads;
+
+  pthread_t thread_array[num_threads];
+  Inputs inputs[num_threads];
+
+  for (int i = 0; i < num_threads; i++) {
+    inputs[i].start = i * band_size;
+    inputs[i].end = (i + 1) * band_size;
+    inputs[i].power = band_power;
+    inputs[i].signal = sig;
+    inputs[i].filter_order = filter_order;
+    inputs[i].bandwidth = bandwidth;
+    inputs[i].filter_coeffs = filter_coeffs;
+    if (i == num_threads - 1) {
+      inputs[i].end += remainder;
+    }
+    pthread_create(&thread_array[i], NULL, worker, &inputs[i]);
   }
+
+  for (int i = 0; i < num_threads; i++) {
+        pthread_join(thread_array[i], NULL);
+    }
+  
+
+
+  // pthread_t* myid = (pthread_t*)malloc(sizeof(pthread_t) * num_threads);
+  // Inputs* inputs = (Inputs*)malloc(sizeof(Inputs) * num_threads);
+  
+
+
+
+
+
+  // below is bad code, embarassingly parallell
+  // for (int band = 0; band < num_bands; band++) {
+  //   // Make the filter
+  //   generate_band_pass(sig->Fs,
+  //                      band * bandwidth + 0.0001, // keep within limits
+  //                      (band + 1) * bandwidth - 0.0001,
+  //                      filter_order,
+  //                      filter_coeffs);
+  //   hamming_window(filter_order,filter_coeffs);
+
+  //   // Convolve
+  //   convolve_and_compute_power(sig->num_samples,
+  //                              sig->data,
+  //                              filter_order,
+  //                              filter_coeffs,
+  //                              &(band_power[band]));
+
+  // }
 
   unsigned long long tend = get_cycle_count();
   double end = get_seconds();
@@ -168,7 +276,7 @@ Context switches %ld\n",
 
 int main(int argc, char* argv[]) {
 
-  if (argc != 6) {
+  if (argc != 8) {
     usage();
     return -1;
   }
@@ -178,6 +286,9 @@ int main(int argc, char* argv[]) {
   double Fs        = atof(argv[3]);
   int filter_order = atoi(argv[4]);
   int num_bands    = atoi(argv[5]);
+  int num_threads  = atoi(argv[6]);
+  int num_processors = atoi(argv[7]);
+
 
   assert(Fs > 0.0);
   assert(filter_order > 0 && !(filter_order & 0x1));
@@ -224,7 +335,7 @@ bands:    %d\n",
 
   double start = 0;
   double end   = 0;
-  if (analyze_signal(sig, filter_order, num_bands, &start, &end)) {
+  if (analyze_signal(sig, filter_order, num_bands, &start, &end, num_threads, num_processors)) {
     printf("POSSIBLE ALIENS %lf-%lf HZ (CENTER %lf HZ)\n", start, end, (end + start) / 2.0);
   } else {
     printf("no aliens\n");
